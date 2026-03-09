@@ -247,7 +247,7 @@ export default function App() {
   const [visitorCount, setVisitorCount] = useState<number | null>(null);
 
   // Birthday Date: March 10, 2026
-  const birthdayDate = new Date('2026-03-09T00:00:00');
+  const birthdayDate = new Date('2026-03-21T00:00:00');
 
   useEffect(() => {
     const fetchWishes = async () => {
