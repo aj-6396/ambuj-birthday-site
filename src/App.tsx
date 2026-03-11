@@ -25,6 +25,7 @@ import {
 import confetti from 'canvas-confetti';
 import { Wish } from './types';
 import { cn, RANDOM_WISHES, BALLOON_MESSAGES } from './utils';
+import { supabase } from './supabase';
 
 // --- Components ---
 
@@ -244,37 +245,63 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [typed, setTyped] = useState('');
   const [showLegend, setShowLegend] = useState(false);
-  const [visitorCount, setVisitorCount] = useState<number | null>(null);
 
   // Birthday Date: March 10, 2026
-  const birthdayDate = new Date('2026-03-21T00:00:00');
+  const birthdayDate = new Date('2026-03-09T00:00:00');
 
   useEffect(() => {
-    const fetchWishes = async () => {
-      try {
-        const response = await fetch('/api/wishes');
-        if (response.ok) {
-          const data = await response.json();
-          setWishes(data);
-        }
-      } catch (error) {
-        console.error('Failed to fetch wishes:', error);
-      }
-    };
-    fetchWishes();
+    const fetchAllData = async () => {
+      const { data: wishesData } = await supabase
+        .from('wishes')
+        .select('*')
+        .order('timestamp', { ascending: false });
+      
+      const { data: roastsData } = await supabase
+        .from('roasts')
+        .select('*')
+        .order('timestamp', { ascending: false });
 
-    const fetchStats = async () => {
-      try {
-        const response = await fetch('/api/stats');
-        if (response.ok) {
-          const data = await response.json();
-          setVisitorCount(data.visitors);
-        }
-      } catch (error) {
-        console.error('Failed to fetch stats:', error);
-      }
+      const formattedWishes = (wishesData || []).map(w => ({
+        id: w.id,
+        name: w.name,
+        message: w.message,
+        timestamp: new Date(w.timestamp).getTime(),
+        reactions: {
+          love: w.love || 0,
+          celebrate: w.celebrate || 0,
+          cheer: w.birthday || 0,
+        },
+        type: 'wish'
+      }));
+
+      const formattedRoasts = (roastsData || []).map(r => ({
+        id: r.id,
+        name: r.name,
+        message: r.message,
+        timestamp: new Date(r.timestamp).getTime(),
+        reactions: {
+          laugh: r.laugh || 0,
+          rofl: r.rofl || 0,
+          savage: r.savage || 0,
+        },
+        type: 'roast'
+      }));
+
+      setWishes([...formattedWishes, ...formattedRoasts].sort((a, b) => b.timestamp - a.timestamp));
     };
-    fetchStats();
+
+    fetchAllData();
+
+    // Subscribe to changes
+    const wishesChannel = supabase
+      .channel('wishes-db-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'wishes' }, () => fetchAllData())
+      .subscribe();
+
+    const roastsChannel = supabase
+      .channel('roasts-db-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'roasts' }, () => fetchAllData())
+      .subscribe();
 
     const handleKeyDown = (e: KeyboardEvent) => {
       setTyped(prev => {
@@ -286,7 +313,11 @@ export default function App() {
       });
     };
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      supabase.removeChannel(wishesChannel);
+      supabase.removeChannel(roastsChannel);
+    };
   }, []);
 
   const triggerLegend = () => {
@@ -303,62 +334,58 @@ export default function App() {
     e.preventDefault();
     if (!name.trim() || !message.trim()) return;
 
-    const newWish: Wish = {
-      id: Math.random().toString(36).substr(2, 9),
-      name,
-      message,
-      timestamp: Date.now(),
-      reactions: isRoastMode 
-        ? { laugh: 0, rofl: 0, savage: 0 } as any
-        : { love: 0, celebrate: 0, cheer: 0 } as any,
-      type: isRoastMode ? 'roast' : 'wish'
-    };
-
     try {
-      const response = await fetch('/api/wishes', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newWish)
-      });
-      if (response.ok) {
-        setWishes([newWish, ...wishes]);
-        setLastSubmittedName(name);
-        setName('');
-        setMessage('');
-        setShowPopup(true);
-        
-        confetti({
-          particleCount: 150,
-          spread: 70,
-          origin: { y: 0.6 }
+      if (isRoastMode) {
+        await supabase.from('roasts').insert({
+          name,
+          message,
+          laugh: 0,
+          rofl: 0,
+          savage: 0
+        });
+      } else {
+        await supabase.from('wishes').insert({
+          name,
+          message,
+          love: 0,
+          celebrate: 0,
+          birthday: 0
         });
       }
+
+      setLastSubmittedName(name);
+      setName('');
+      setMessage('');
+      setShowPopup(true);
+      
+      confetti({
+        particleCount: 150,
+        spread: 70,
+        origin: { y: 0.6 }
+      });
     } catch (error) {
-      console.error('Failed to submit wish:', error);
+      console.error('Failed to submit:', error);
     }
   };
 
   const handleReact = async (id: string, reactionType: string) => {
     try {
-      const response = await fetch(`/api/wishes/${id}/react`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reactionType })
-      });
-      if (response.ok) {
-        setWishes(prev => prev.map(w => {
-          if (w.id === id) {
-            return {
-              ...w,
-              reactions: {
-                ...w.reactions,
-                [reactionType]: ((w.reactions as any)[reactionType] || 0) + 1
-              }
-            };
-          }
-          return w;
-        }));
-      }
+      const wish = wishes.find(w => w.id === id);
+      if (!wish) return;
+
+      const collectionName = wish.type === 'wish' ? 'wishes' : 'roasts';
+      
+      // Map UI reaction names to Supabase field names
+      let fieldName = reactionType;
+      if (reactionType === 'cheer') fieldName = 'birthday';
+
+      const currentReactionCount = (wish.reactions as any)[reactionType] || 0;
+
+      await supabase
+        .from(collectionName)
+        .update({ [fieldName]: currentReactionCount + 1 })
+        .eq('id', id);
+
     } catch (error) {
       console.error('Failed to react:', error);
     }
@@ -376,7 +403,7 @@ export default function App() {
   };
 
   const shareWhatsApp = () => {
-    const text = `I just wished Ambuj a Happy Birthday 🎂 Leave your message too! ${window.location.href}`;
+    const text = `I just wished AJ a Happy Birthday 🎂 Leave your message too! ${window.location.href}`;
     window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank');
   };
 
@@ -493,13 +520,13 @@ export default function App() {
             <div className="aspect-square rounded-[40px] overflow-hidden glass p-4">
               <div className="w-full h-full rounded-[32px] bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
                 <img 
-                  src="https://kalkifoundation.in/wp-content/uploads/2025/07/aj-proffessional-300x300.webp" 
-                  alt="Ambuj" 
-                
+                  src="https://picsum.photos/seed/aj/800/800" 
+                  alt="AJ" 
+                  className="w-full h-full object-cover rounded-[32px] opacity-80 mix-blend-overlay"
                   referrerPolicy="no-referrer"
                 />
                 <div className="absolute inset-0 flex items-center justify-center">
-                
+                  <span className="text-6xl font-black text-white/20">AJ</span>
                 </div>
               </div>
             </div>
@@ -713,7 +740,7 @@ export default function App() {
               <Flame className="text-orange-500/50" size={40} />
             </div>
             <h3 className="text-2xl font-bold text-slate-500">No roasts yet.</h3>
-            <p className="text-slate-600 mt-2">Ambuj is safe... for now. 🔥</p>
+            <p className="text-slate-600 mt-2">AJ is safe... for now. 🔥</p>
           </div>
         )}
       </section>
@@ -722,13 +749,13 @@ export default function App() {
       <footer className="py-12 px-6 border-t border-white/5 text-center">
         <div className="max-w-4xl mx-auto">
           <h2 className="text-2xl font-black mb-4 text-gradient">AJ's Birthday 2026</h2>
-          <p className="text-slate-500 mb-8">Made with ❤️ and a lot of tea 😂.</p>
+          <p className="text-slate-500 mb-8">Made with ❤️ and a lot of coffee.</p>
           
-          {visitorCount !== null && (
+          {wishes.length > 0 && (
             <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-white/5 border border-white/10 mb-8">
               <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
               <span className="text-sm font-medium text-slate-400">
-                <span className="text-white font-bold">{visitorCount}</span> visitors have joined the party!
+                <span className="text-white font-bold">{wishes.length}</span> messages have been shared!
               </span>
             </div>
           )}
